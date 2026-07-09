@@ -14,7 +14,11 @@ from kfactory.routing.electrical import (
     route_bundle_dual_rails,
     route_dual_rails,
 )
-from kfactory.routing.manhattan import ManhattanRouter
+from kfactory.routing.generic import (
+    ManhattanBundlePlanner,
+    ManhattanRoute,
+)
+from kfactory.routing.manhattan import ManhattanRouter, route_smart
 from kfactory.routing.optical import (
     LoopPosition,
     LoopSide,
@@ -25,13 +29,25 @@ from kfactory.routing.optical import (
 from kfactory.routing.optical import (
     route_bundle as optical_route_bundle,
 )
+from kfactory.routing.steps import Straight
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from tests.conftest import Layers
 
 # vec_angle
+
+
+def unreachable_placer(
+    c: kf.KCell,
+    p1: kf.Port,
+    p2: kf.Port,
+    pts: Sequence[kf.kdb.Point],
+    route_width: int | None = None,
+    **kwargs: object,
+) -> ManhattanRoute:
+    raise AssertionError("unreachable")
 
 
 def test_vec_angle_positive_x() -> None:
@@ -58,6 +74,159 @@ def test_vec_angle_zero_vector() -> None:
 def test_vec_angle_non_manhattan_raises() -> None:
     with pytest.raises(ValueError, match="Non-manhattan"):
         vec_angle(kf.kdb.Vector(100, 100))
+
+
+def test_route_bundle_plan_materializer_boundary(
+    kcl: kf.KCLayout, layers: Layers
+) -> None:
+    c = kcl.kcell("route_bundle_plan_boundary")
+    enc = kf.LayerEnclosure(
+        sections=[(layers.WGEX, 5000)],
+        name="WG",
+        main_layer=layers.WG,
+    )
+    xs = c.kcl.get_icross_section(
+        cross_section=kf.SymmetricalCrossSection(width=1000, enclosure=enc)
+    )
+    start = c.create_port(
+        trans=kf.kdb.Trans(rot=0, mirrx=False, x=0, y=0),
+        cross_section=xs,
+        name="start",
+    )
+    end = c.create_port(
+        trans=kf.kdb.Trans(rot=2, mirrx=False, x=100_000, y=0),
+        cross_section=xs,
+        name="end",
+    )
+
+    planner = ManhattanBundlePlanner(
+        c=c,
+        start_ports=[start.base],
+        end_ports=[end.base],
+        route_width=None,
+        on_collision="error",
+        on_placer_error="error",
+        collision_check_layers=None,
+        routing_function=route_smart,
+        routing_kwargs={
+            "bend90_radius": 10_000,
+            "separation": 5_000,
+            "sort_ports": False,
+            "bbox_routing": "minimal",
+            "bboxes": [],
+            "waypoints": None,
+            "allow_sbend": False,
+        },
+        placer_function=unreachable_placer,
+        placer_kwargs={},
+        constraints=None,
+        starts=[],
+        ends=[],
+        start_angles=None,
+        end_angles=None,
+        route_name=None,
+    )
+
+    placed: list[tuple[str | None, str | None, list[kf.kdb.Point]]] = []
+
+    def placer(
+        c: kf.KCell,
+        p1: kf.Port,
+        p2: kf.Port,
+        pts: Sequence[kf.kdb.Point],
+        route_width: int | None = None,
+        **kwargs: object,
+    ) -> ManhattanRoute:
+        placed.append((p1.name, p2.name, list(pts)))
+        return ManhattanRoute(backbone=list(pts), start_port=p1, end_port=p2)
+
+    inputs = planner.normalize_inputs()
+    plan = planner.plan(inputs)
+    planner.placer_function = placer
+    routes = planner.materialize(plan)
+
+    assert len(plan.routers) == 1
+    assert plan.start_ports == [start.base]
+    assert plan.end_ports == [end.base]
+    assert len(routes) == 1
+    assert placed == [("start", "end", plan.routers[0].start.pts)]
+
+
+def test_route_bundle_input_normalization(kcl: kf.KCLayout, layers: Layers) -> None:
+    c = kcl.kcell("route_bundle_input_normalization")
+    enc = kf.LayerEnclosure(
+        sections=[(layers.WGEX, 5000)],
+        name="WG",
+        main_layer=layers.WG,
+    )
+    xs = c.kcl.get_icross_section(
+        cross_section=kf.SymmetricalCrossSection(width=1000, enclosure=enc)
+    )
+    start_ports = [
+        c.create_port(
+            trans=kf.kdb.Trans(rot=0, mirrx=False, x=0, y=i * 10_000),
+            cross_section=xs,
+            name=f"start_{i}",
+        ).base
+        for i in range(2)
+    ]
+    end_ports = [
+        c.create_port(
+            trans=kf.kdb.Trans(rot=2, mirrx=False, x=100_000, y=i * 10_000),
+            cross_section=xs,
+            name=f"end_{i}",
+        ).base
+        for i in range(2)
+    ]
+
+    planner = ManhattanBundlePlanner(
+        c=c,
+        start_ports=start_ports,
+        end_ports=end_ports,
+        route_width=1200,
+        on_collision="error",
+        on_placer_error="error",
+        collision_check_layers=None,
+        routing_function=route_smart,
+        routing_kwargs={},
+        placer_function=unreachable_placer,
+        placer_kwargs={},
+        constraints=None,
+        starts=50_000,
+        ends=[[Straight(dist=10_000)], [Straight(dist=20_000)]],
+        start_angles=1,
+        end_angles=[3, 3],
+        route_name=None,
+    )
+    inputs = planner.normalize_inputs()
+
+    assert inputs.widths == [1200, 1200]
+    assert [p.get_trans().angle for p in inputs.start_ports] == [1, 1]
+    assert [p.get_trans().angle for p in inputs.end_ports] == [3, 3]
+    assert all(
+        isinstance(step, Straight)
+        for route_steps in inputs.starts
+        for step in route_steps
+    )
+    assert all(
+        isinstance(step, Straight)
+        for route_steps in inputs.ends
+        for step in route_steps
+    )
+    assert [
+        [step.dist for step in route_steps if isinstance(step, Straight)]
+        for route_steps in inputs.starts
+    ] == [
+        [50_000],
+        [50_000],
+    ]
+    assert [
+        [step.dist for step in route_steps if isinstance(step, Straight)]
+        for route_steps in inputs.ends
+    ] == [
+        [10_000],
+        [20_000],
+    ]
 
 
 # place_single_wire / route_dual_rails

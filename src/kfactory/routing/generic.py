@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeGuard, cast
 
 import klayout.db as kdb
@@ -29,6 +30,8 @@ if TYPE_CHECKING:
     from .utils import RouteDebug
 
 __all__ = [
+    "ManhattanBundlePlan",
+    "ManhattanBundlePlanner",
     "ManhattanRoute",
     "PlacerFunction",
     "check_collisions",
@@ -96,6 +99,232 @@ class ManhattanRoute(BaseModel, arbitrary_types_allowed=True):
     @property
     def length(self) -> int | float:
         return self.length_function(self)
+
+
+@dataclass(slots=True)
+class ManhattanBundlePlan:
+    routers: list[ManhattanRouter]
+    start_ports: list[BasePort]
+    end_ports: list[BasePort]
+
+
+@dataclass(slots=True)
+class _NormalizedManhattanBundleInputs:
+    start_ports: list[BasePort]
+    end_ports: list[BasePort]
+    widths: Sequence[int]
+    starts: Sequence[Sequence[Step]]
+    ends: Sequence[Sequence[Step]]
+
+
+@dataclass(slots=True)
+class ManhattanBundlePlanner:
+    c: KCell
+    start_ports: list[BasePort]
+    end_ports: list[BasePort]
+    route_width: dbu | list[dbu] | None
+    on_collision: Literal["error", "show_error"] | None
+    on_placer_error: Literal["error", "show_error"] | None
+    collision_check_layers: Sequence[kdb.LayerInfo] | None
+    routing_function: ManhattanBundleRoutingFunction
+    routing_kwargs: dict[str, Any]
+    placer_function: PlacerFunction
+    placer_kwargs: dict[str, Any]
+    constraints: Sequence[Constraint] | None
+    starts: dbu | list[dbu] | list[Step] | list[list[Step]] | None
+    ends: dbu | list[dbu] | list[Step] | list[list[Step]] | None
+    start_angles: int | list[int] | None
+    end_angles: int | list[int] | None
+    route_name: str | None
+
+    def normalize_inputs(self) -> _NormalizedManhattanBundleInputs:
+        if not self.start_ports:
+            return _NormalizedManhattanBundleInputs([], [], [], [], [])
+        if not (len(self.start_ports) == len(self.end_ports)):
+            raise ValueError(
+                "For bundle routing the input port list must have"
+                " the same size as the end ports and be the same length."
+            )
+
+        length = len(self.start_ports)
+        normalized_starts = self._normalize_route_steps(self.starts, length)
+        normalized_ends = self._normalize_route_steps(self.ends, length)
+        normalized_start_ports = self._normalize_port_angles(
+            self.start_ports, self.start_angles
+        )
+        normalized_end_ports = self._normalize_port_angles(
+            self.end_ports, self.end_angles
+        )
+        widths = self._normalize_route_widths(self.route_width, normalized_start_ports)
+
+        return _NormalizedManhattanBundleInputs(
+            start_ports=normalized_start_ports,
+            end_ports=normalized_end_ports,
+            widths=widths,
+            starts=normalized_starts,
+            ends=normalized_ends,
+        )
+
+    def plan(self, inputs: _NormalizedManhattanBundleInputs) -> ManhattanBundlePlan:
+        routers = self.routing_function(
+            start_ports=inputs.start_ports,
+            end_ports=inputs.end_ports,
+            widths=inputs.widths,
+            starts=inputs.starts,
+            ends=inputs.ends,
+            **self.routing_kwargs,
+        )
+
+        if not routers:
+            return ManhattanBundlePlan(routers=[], start_ports=[], end_ports=[])
+
+        start_mapping = {sp.get_trans(): sp for sp in inputs.start_ports}
+        end_mapping = {ep.get_trans(): ep for ep in inputs.end_ports}
+        ordered_start_ports = []
+        ordered_end_ports = []
+        for router in routers:
+            sp = start_mapping[router.start_transformation]
+            ep = end_mapping[router.end_transformation]
+            ordered_start_ports.append(sp)
+            ordered_end_ports.append(ep)
+
+        return ManhattanBundlePlan(
+            routers=routers,
+            start_ports=ordered_start_ports,
+            end_ports=ordered_end_ports,
+        )
+
+    def enforce_constraints(self, plan: ManhattanBundlePlan) -> None:
+        if self.constraints:
+            for constraint in self.constraints:
+                constraint.enforce(
+                    c=self.c,
+                    routers=plan.routers,
+                    route_name=self.route_name,
+                )
+
+    def materialize(self, plan: ManhattanBundlePlan) -> list[ManhattanRoute]:
+        routes: list[ManhattanRoute] = []
+        placer_errors: list[Exception] = []
+        error_routes: list[tuple[BasePort, BasePort, list[kdb.Point], int]] = []
+        for router, ps, pe in zip(
+            plan.routers, plan.start_ports, plan.end_ports, strict=False
+        ):
+            try:
+                route = self.placer_function(
+                    self.c,
+                    Port(base=ps),
+                    Port(base=pe),
+                    router.start.pts,
+                    **self.placer_kwargs,
+                )
+                routes.append(route)
+            except Exception as e:
+                placer_errors.append(e)
+                error_routes.append((ps, pe, router.start.pts, router.width))
+        if placer_errors and self.on_placer_error == "show_error":
+            self.show_placer_errors(placer_errors, error_routes)
+        if placer_errors and self.on_placer_error is not None:
+            for error in placer_errors:
+                logger.error(error)
+            if self.c.name.startswith("Unnamed_"):
+                self.c.name = self.c.kcl._future_cell_name or self.c.name
+            raise PlacerError(
+                "Failed to place routes for bundle routing from "
+                f"{[p.name for p in plan.start_ports]} to "
+                f"{[p.name for p in plan.end_ports]}"
+            )
+
+        return routes
+
+    def show_placer_errors(
+        self,
+        placer_errors: Sequence[Exception],
+        error_routes: Sequence[tuple[BasePort, BasePort, list[kdb.Point], int]],
+    ) -> None:
+        db = rdb.ReportDatabase("Route Placing Errors")
+        self.c.name = self.c.kcl._future_cell_name or self.c.name
+        cell = db.create_cell(self.c.name)
+        for error, (ps, pe, pts, width) in zip(
+            placer_errors, error_routes, strict=False
+        ):
+            cat = db.create_category(f"{ps.name} - {pe.name}")
+            it = db.create_item(cell=cell, category=cat)
+            it.add_value(
+                f"Error while trying to place route from {ps.name} to {pe.name} at"
+                f" points (dbu): {pts}"
+            )
+            it.add_value(f"Exception: {error}")
+            path = kdb.Path(pts, width or ps.any_cross_section.width)
+            it.add_value(self.c.kcl.to_um(path.polygon()))
+        self.c.show(lyrdb=db)
+
+    def record_constraint_routes(self, routes: list[ManhattanRoute]) -> None:
+        if self.constraints:
+            for constraint in self.constraints:
+                constraint._routes[self.route_name] = routes
+
+    def check_collisions(
+        self, plan: ManhattanBundlePlan, routes: list[ManhattanRoute]
+    ) -> None:
+        check_collisions(
+            c=self.c,
+            start_ports=plan.start_ports,
+            end_ports=plan.end_ports,
+            on_collision=self.on_collision,
+            collision_check_layers=self.collision_check_layers,
+            routers=plan.routers,
+            routes=routes,
+        )
+
+    @staticmethod
+    def _normalize_route_steps(
+        steps: dbu | list[dbu] | list[Step] | list[list[Step]] | None,
+        length: int,
+    ) -> Sequence[Sequence[Step]]:
+        if steps is None or steps == []:
+            return [[]] * length
+        if isinstance(steps, int):
+            return [[Straight(dist=steps)] for _ in range(length)]
+        if _is_steps_list(steps):
+            return [steps for _ in range(length)]
+        if _is_steps_matrix(steps):
+            return steps
+        steps = cast("list[int]", steps)
+        return [[Straight(dist=s) for s in steps]] * length
+
+    @staticmethod
+    def _normalize_port_angles(
+        ports: list[BasePort],
+        angles: int | list[int] | None,
+    ) -> list[BasePort]:
+        if angles is None:
+            return ports
+        if isinstance(angles, int):
+            return [
+                p.transformed(post_trans=kdb.Trans(angles - p.get_trans().angle))
+                for p in ports
+            ]
+        if not len(angles) == len(ports):
+            raise ValueError(
+                "If more than one end port should be rotated,"
+                " a rotation for all ports must be provided."
+            )
+        return [
+            p.transformed(post_trans=kdb.Trans(a - p.get_trans().angle))
+            for a, p in zip(angles, ports, strict=False)
+        ]
+
+    @staticmethod
+    def _normalize_route_widths(
+        route_width: dbu | list[dbu] | None,
+        start_ports: Sequence[BasePort],
+    ) -> Sequence[int]:
+        if route_width:
+            if isinstance(route_width, int):
+                return [route_width] * len(start_ports)
+            return route_width
+        return [p.any_cross_section.width for p in start_ports]
 
 
 def check_collisions(
@@ -413,162 +642,37 @@ def route_bundle(
         routing_kwargs = {"bbox_routing": "minimal"}
     if route_debug is not None:
         routing_kwargs["route_debug"] = route_debug
-    if not start_ports:
-        return []
-    if not (len(start_ports) == len(end_ports)):
-        raise ValueError(
-            "For bundle routing the input port list must have"
-            " the same size as the end ports and be the same length."
-        )
-    length = len(start_ports)
-    if starts is None or starts == []:
-        starts = [[]] * length
-    elif isinstance(starts, int):
-        starts = [[Straight(dist=starts)] for _ in range(length)]
-    elif isinstance(starts, list):
-        if _is_steps_list(starts):
-            starts = [starts for _ in range(len(start_ports))]
-        else:
-            starts = cast("list[int]", starts)
-            starts = [[Straight(dist=s) for s in starts]] * len(start_ports)
-    if ends is None or ends == []:
-        ends = [[]] * length
-    elif isinstance(ends, int):
-        ends = [[Straight(dist=ends)] for _ in range(length)]
-    elif isinstance(ends, list):
-        if _is_steps_list(ends):
-            ends = [ends for _ in range(len(end_ports))]
-        else:
-            ends = cast("list[int]", ends)
-            ends = [[Straight(dist=e) for e in ends]] * len(end_ports)
-
-    if start_angles is not None:
-        if isinstance(start_angles, int):
-            start_ports = [
-                p.transformed(post_trans=kdb.Trans(start_angles - p.get_trans().angle))
-                for p in start_ports
-            ]
-        else:
-            if not len(start_angles) == len(start_ports):
-                raise ValueError(
-                    "If more than one end port should be rotated,"
-                    " a rotation for all ports must be provided."
-                )
-            start_ports = [
-                p.transformed(post_trans=kdb.Trans(a - p.get_trans().angle))
-                for a, p in zip(start_angles, start_ports, strict=False)
-            ]
-
-    if end_angles is not None:
-        if isinstance(end_angles, int):
-            end_ports = [
-                p.transformed(post_trans=kdb.Trans(end_angles - p.get_trans().angle))
-                for p in end_ports
-            ]
-        else:
-            if not len(end_angles) == len(end_ports):
-                raise ValueError(
-                    "If more than one end port should be rotated,"
-                    " a rotation for all ports must be provided."
-                )
-            end_ports = [
-                p.transformed(post_trans=kdb.Trans(a - p.get_trans().angle))
-                for a, p in zip(end_angles, end_ports, strict=False)
-            ]
-
-    if route_width:
-        if isinstance(route_width, int):
-            widths = [route_width] * len(start_ports)
-        else:
-            widths = route_width
-    else:
-        widths = [p.any_cross_section.width for p in start_ports]
-
-    routers = routing_function(
-        start_ports=start_ports,
-        end_ports=end_ports,
-        widths=widths,
-        starts=starts,
-        ends=ends,
-        **routing_kwargs,
-    )
-
-    if not routers:
-        return []
-
-    start_mapping = {sp.get_trans(): sp for sp in start_ports}
-    end_mapping = {ep.get_trans(): ep for ep in end_ports}
-    routes: list[ManhattanRoute] = []
-    start_ports = []
-    end_ports = []
-
-    for router in routers:
-        sp = start_mapping[router.start_transformation]
-        ep = end_mapping[router.end_transformation]
-        start_ports.append(sp)
-        end_ports.append(ep)
-
-    if constraints:
-        for constraint in constraints:
-            constraint.enforce(
-                c=c,
-                routers=routers,
-                route_name=route_name,
-            )
-    placer_errors: list[Exception] = []
-    error_routes: list[tuple[BasePort, BasePort, list[kdb.Point], int]] = []
-    for router, ps, pe in zip(routers, start_ports, end_ports, strict=False):
-        try:
-            route = placer_function(
-                c,
-                Port(base=ps),
-                Port(base=pe),
-                router.start.pts,
-                **placer_kwargs,
-            )
-            routes.append(route)
-        except Exception as e:
-            placer_errors.append(e)
-            error_routes.append((ps, pe, router.start.pts, router.width))
-    if placer_errors and on_placer_error == "show_error":
-        db = rdb.ReportDatabase("Route Placing Errors")
-        c.name = c.kcl._future_cell_name or c.name
-        cell = db.create_cell(c.name)
-        for error, (ps, pe, pts, width) in zip(
-            placer_errors, error_routes, strict=False
-        ):
-            cat = db.create_category(f"{ps.name} - {pe.name}")
-            it = db.create_item(cell=cell, category=cat)
-            it.add_value(
-                f"Error while trying to place route from {ps.name} to {pe.name} at"
-                f" points (dbu): {pts}"
-            )
-            it.add_value(f"Exception: {error}")
-            path = kdb.Path(pts, width or ps.any_cross_section.width)
-            it.add_value(c.kcl.to_um(path.polygon()))
-        c.show(lyrdb=db)
-    if placer_errors and on_placer_error is not None:
-        for error in placer_errors:
-            logger.error(error)
-        if c.name.startswith("Unnamed_"):
-            c.name = c.kcl._future_cell_name or c.name
-        raise PlacerError(
-            "Failed to place routes for bundle routing from "
-            f"{[p.name for p in start_ports]} to {[p.name for p in end_ports]}"
-        )
-
-    check_collisions(
+    planner = ManhattanBundlePlanner(
         c=c,
         start_ports=start_ports,
         end_ports=end_ports,
+        route_width=route_width,
         on_collision=on_collision,
+        on_placer_error=on_placer_error,
         collision_check_layers=collision_check_layers,
-        routers=routers,
-        routes=routes,
+        routing_function=routing_function,
+        routing_kwargs=routing_kwargs,
+        placer_function=placer_function,
+        placer_kwargs=placer_kwargs,
+        constraints=constraints,
+        starts=starts,
+        ends=ends,
+        start_angles=start_angles,
+        end_angles=end_angles,
+        route_name=route_name,
     )
-    if constraints:
-        for constraint in constraints:
-            constraint._routes[route_name] = routes
+    inputs = planner.normalize_inputs()
+    if not inputs.start_ports:
+        return []
+
+    plan = planner.plan(inputs)
+    if not plan.routers:
+        return []
+
+    planner.enforce_constraints(plan)
+    routes = planner.materialize(plan)
+    planner.check_collisions(plan, routes)
+    planner.record_constraint_routes(routes)
     return routes
 
 
@@ -576,3 +680,9 @@ def _is_steps_list(
     step_list: list[Step] | list[int] | list[list[Step]],
 ) -> TypeGuard[list[Step]]:
     return isinstance(step_list[0], Step)
+
+
+def _is_steps_matrix(
+    step_list: list[Step] | list[int] | list[list[Step]],
+) -> TypeGuard[list[list[Step]]]:
+    return isinstance(step_list[0], list)
