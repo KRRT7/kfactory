@@ -18,7 +18,11 @@ from kfactory.routing.generic import (
     ManhattanBundlePlanner,
     ManhattanRoute,
 )
-from kfactory.routing.manhattan import ManhattanRouter, route_smart
+from kfactory.routing.manhattan import (
+    ManhattanChannelPlanner,
+    ManhattanRouter,
+    route_smart,
+)
 from kfactory.routing.optical import (
     LoopPosition,
     LoopSide,
@@ -227,6 +231,177 @@ def test_route_bundle_input_normalization(kcl: kf.KCLayout, layers: Layers) -> N
         [10_000],
         [20_000],
     ]
+
+
+def test_route_smart_direct_parallel_bank(kcl: kf.KCLayout, layers: Layers) -> None:
+    start_ports = [
+        kf.Port(
+            name=f"s{i}",
+            trans=kf.kdb.Trans(1, False, i * 10_000, 0),
+            width=1000,
+            layer_info=layers.WG,
+            kcl=kcl,
+            port_type="optical",
+        )
+        for i in range(5)
+    ]
+    end_ports = [
+        kf.Port(
+            name=f"e{i}",
+            trans=kf.kdb.Trans(3, False, i * 10_000, 100_000),
+            width=1000,
+            layer_info=layers.WG,
+            kcl=kcl,
+            port_type="optical",
+        )
+        for i in range(5)
+    ]
+
+    routers = route_smart(
+        start_ports=[p.base for p in start_ports],
+        end_ports=[p.base for p in end_ports],
+        starts=[[] for _ in start_ports],
+        ends=[[] for _ in start_ports],
+        widths=[p.width for p in start_ports],
+        bend90_radius=5_000,
+        separation=2_000,
+        bboxes=[],
+        sort_ports=False,
+    )
+
+    assert len(routers) == len(start_ports)
+    assert all(router.finished for router in routers)
+    assert [router.start.pts for router in routers] == [
+        [start.trans.disp.to_p(), end.trans.disp.to_p()]
+        for start, end in zip(start_ports, end_ports, strict=False)
+    ]
+
+
+def test_channel_planner_routes_independent_no_obstacle_channels() -> None:
+    routers = [
+        ManhattanRouter(
+            bend90_radius=5_000,
+            separation=2_000,
+            start_transformation=kf.kdb.Trans(0, False, 0, 0),
+            end_transformation=kf.kdb.Trans(3, False, 20_000, 20_000),
+            width=1_000,
+        ),
+        ManhattanRouter(
+            bend90_radius=5_000,
+            separation=2_000,
+            start_transformation=kf.kdb.Trans(0, False, 0, 50_000),
+            end_transformation=kf.kdb.Trans(3, False, 20_000, 70_000),
+            width=1_000,
+        ),
+    ]
+
+    planner = ManhattanChannelPlanner(
+        routers=routers,
+        starts=[[], []],
+        ends=[[], []],
+        bboxes=[],
+        sort_ports=False,
+        waypoints=None,
+        separation=2_000,
+        route_debug=None,
+    )
+
+    assert planner.try_route()
+    assert [router.start.pts for router in routers] == [
+        [kf.kdb.Point(0, 0), kf.kdb.Point(20_000, 0), kf.kdb.Point(20_000, 20_000)],
+        [
+            kf.kdb.Point(0, 50_000),
+            kf.kdb.Point(20_000, 50_000),
+            kf.kdb.Point(20_000, 70_000),
+        ],
+    ]
+
+
+def test_channel_planner_routes_independent_channels_past_unrelated_bboxes() -> None:
+    routers = [
+        ManhattanRouter(
+            bend90_radius=5_000,
+            separation=2_000,
+            start_transformation=kf.kdb.Trans(0, False, 0, 0),
+            end_transformation=kf.kdb.Trans(3, False, 20_000, 20_000),
+            width=1_000,
+        )
+    ]
+
+    planner = ManhattanChannelPlanner(
+        routers=routers,
+        starts=[[]],
+        ends=[[]],
+        bboxes=[kf.kdb.Box(100_000, 100_000, 120_000, 120_000)],
+        sort_ports=False,
+        waypoints=None,
+        separation=2_000,
+        route_debug=None,
+    )
+
+    assert planner.try_route()
+    assert routers[0].start.pts == [
+        kf.kdb.Point(0, 0),
+        kf.kdb.Point(20_000, 0),
+        kf.kdb.Point(20_000, 20_000),
+    ]
+
+
+def test_channel_planner_rejects_independent_channels_hitting_bbox() -> None:
+    routers = [
+        ManhattanRouter(
+            bend90_radius=5_000,
+            separation=2_000,
+            start_transformation=kf.kdb.Trans(0, False, 0, 0),
+            end_transformation=kf.kdb.Trans(3, False, 20_000, 20_000),
+            width=1_000,
+        )
+    ]
+    initial_start_pts = list(routers[0].start.pts)
+    initial_end_pts = list(routers[0].end.pts)
+
+    planner = ManhattanChannelPlanner(
+        routers=routers,
+        starts=[[]],
+        ends=[[]],
+        bboxes=[kf.kdb.Box(10_000, -1_000, 11_000, 1_000)],
+        sort_ports=False,
+        waypoints=None,
+        separation=2_000,
+        route_debug=None,
+    )
+
+    assert not planner.try_route()
+    assert routers[0].start.pts == initial_start_pts
+    assert routers[0].end.pts == initial_end_pts
+    assert not routers[0].finished
+
+
+def test_channel_planner_rejects_independent_channels_starting_in_bbox() -> None:
+    routers = [
+        ManhattanRouter(
+            bend90_radius=5_000,
+            separation=2_000,
+            start_transformation=kf.kdb.Trans(0, False, 0, 0),
+            end_transformation=kf.kdb.Trans(3, False, 20_000, 20_000),
+            width=1_000,
+        )
+    ]
+
+    planner = ManhattanChannelPlanner(
+        routers=routers,
+        starts=[[]],
+        ends=[[]],
+        bboxes=[kf.kdb.Box(-1_000, -1_000, 1_000, 1_000)],
+        sort_ports=False,
+        waypoints=None,
+        separation=2_000,
+        route_debug=None,
+    )
+
+    assert not planner.try_route()
+    assert routers[0].start.pts == [kf.kdb.Point(0, 0)]
+    assert not routers[0].finished
 
 
 # place_single_wire / route_dual_rails

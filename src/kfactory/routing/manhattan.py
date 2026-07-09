@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import InitVar, dataclass, field
 from functools import cached_property
+from itertools import pairwise
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -17,7 +18,6 @@ from typing import (
 )
 
 import klayout.db as kdb
-import numpy as np
 
 from ..conf import (
     ANGLE_90,
@@ -937,7 +937,7 @@ def route_smart(
     if bboxes:
         for box in bboxes:
             box_region.insert(box)
-            box_region.merge()
+        box_region.merge()
     if sort_ports:
         if bboxes is None:
             logger.warning(
@@ -1284,6 +1284,19 @@ def route_smart(
                 )
             )
 
+    channel_planner = ManhattanChannelPlanner(
+        routers=all_routers,
+        starts=starts,
+        ends=ends,
+        bboxes=bboxes,
+        sort_ports=sort_ports,
+        waypoints=waypoints,
+        separation=separation,
+        route_debug=route_debug,
+    )
+    if channel_planner.try_route():
+        return all_routers
+
     # ── Retry loop for bundle-overlap correction ─────────────────────
     # After running the bundling + routing logic, check whether any two
     # bundles' actual routed paths overlap.  If they do, the initial
@@ -1304,6 +1317,7 @@ def route_smart(
         for r in all_routers
     ]
     _router_extra_bbox: list[kdb.Box | None] = [None] * len(all_routers)
+    _router_index = {id(router): i for i, router in enumerate(all_routers)}
     _max_overlap_retries = 5
     for _retry_attempt in range(_max_overlap_retries):
         if _retry_attempt > 0:
@@ -1665,22 +1679,28 @@ def route_smart(
         # extend the affected routers' router_bbox via _router_extra_bbox
         # so the next attempt will bundle them together.
         _bundle_regions: list[kdb.Region] = []
+        _bundle_bboxes: list[kdb.Box] = []
         for _bundle in bundled_routers:
             _region = kdb.Region()
+            _bbox = kdb.Box()
             for _router in _bundle:
                 _pts = list(_router.start.pts) + list(reversed(_router.end.pts))
                 if len(_pts) >= 2:
                     _path = kdb.Path(_pts, _router.width)
                     _region.insert(_path.polygon())
+                    _bbox += _path.bbox()
             _bundle_regions.append(_region)
+            _bundle_bboxes.append(_bbox)
         _found_overlap = False
         for _bi in range(len(_bundle_regions)):
             for _bj in range(_bi + 1, len(_bundle_regions)):
+                if (_bundle_bboxes[_bi] & _bundle_bboxes[_bj]).empty():
+                    continue
                 _inter = _bundle_regions[_bi] & _bundle_regions[_bj]
                 if not _inter.is_empty():
                     _overlap_bbox = _inter.bbox()
                     for _router in bundled_routers[_bi] + bundled_routers[_bj]:
-                        _idx = all_routers.index(_router)
+                        _idx = _router_index[id(_router)]
                         _existing = _router_extra_bbox[_idx]
                         if _existing is None:
                             _router_extra_bbox[_idx] = _overlap_bbox.dup()
@@ -1747,6 +1767,216 @@ def route_smart(
                 pt1 = pt2
 
     return all_routers
+
+
+@dataclass(slots=True)
+class BBoxIndex:
+    boxes: Sequence[kdb.Box] | None
+    indexed_boxes: list[kdb.Box] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.indexed_boxes = sorted(
+            (box for box in self.boxes or () if not box.empty()),
+            key=lambda box: (box.left, box.bottom, box.right, box.top),
+        )
+
+    @property
+    def empty(self) -> bool:
+        return not self.indexed_boxes
+
+    def iter_intersecting(self, bbox: kdb.Box) -> Iterable[kdb.Box]:
+        if bbox.empty():
+            return
+        for box in self.indexed_boxes:
+            if box.left > bbox.right:
+                break
+            if box.right < bbox.left:
+                continue
+            if not (box & bbox).empty():
+                yield box
+
+    def contains_point(self, point: kdb.Point) -> bool:
+        for box in self.indexed_boxes:
+            if box.left > point.x:
+                break
+            if box.right < point.x:
+                continue
+            if box.contains(point):
+                return True
+        return False
+
+    def intersects_region(self, region: kdb.Region) -> bool:
+        bbox = region.bbox()
+        for box in self.iter_intersecting(bbox):
+            if not (region & kdb.Region(box)).is_empty():
+                return True
+        return False
+
+
+@dataclass(slots=True)
+class ManhattanChannelPlanner:
+    routers: Sequence[ManhattanRouter]
+    starts: Sequence[Sequence[Step]]
+    ends: Sequence[Sequence[Step]]
+    bboxes: Sequence[kdb.Box] | None
+    sort_ports: bool
+    waypoints: Sequence[kdb.Point] | kdb.Trans | None
+    separation: int
+    route_debug: RouteDebug | None
+    bbox_index: BBoxIndex = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.bbox_index = BBoxIndex(self.bboxes)
+
+    def try_route(self) -> bool:
+        return (
+            self.route_direct_parallel_bank()
+            or self.route_obstacle_free_independent_channels()
+        )
+
+    def route_direct_parallel_bank(self) -> bool:
+        if not self.can_use_independent_channel_paths():
+            return False
+
+        angle = self.routers[0].start.t.angle
+        end_angle = (angle + ANGLE_180) % 4
+        inverse_direction = kdb.Trans(-angle, False, 0, 0)
+        routed_lines: list[tuple[int, int]] = []
+
+        for router in self.routers:
+            if router.start.t.angle != angle or router.end.t.angle != end_angle:
+                return False
+            tv = router.start.tv
+            if router.start.ta != ANGLE_180 or tv.y != 0 or tv.x < 0:
+                return False
+            routed_lines.append(
+                ((inverse_direction * router.start.t.disp).y, router.width)
+            )
+
+        if not self.lines_keep_spacing(routed_lines):
+            return False
+
+        if self.bbox_index.empty:
+            for router in self.routers:
+                router.finish()
+            return True
+
+        router_state = self.save_router_state()
+        try:
+            for router in self.routers:
+                router.finish()
+            if self.routes_keep_clearance():
+                return True
+        except ValueError:
+            pass
+
+        self.restore_router_state(router_state)
+        return False
+
+    def can_use_independent_channel_paths(self) -> bool:
+        return not (
+            self.sort_ports
+            or self.waypoints is not None
+            or self.route_debug is not None
+            or any(self.starts)
+            or any(self.ends)
+            or self.endpoints_touch_bboxes()
+            or not self.routers
+        )
+
+    def endpoints_touch_bboxes(self) -> bool:
+        if self.bbox_index.empty:
+            return False
+        return any(
+            self.bbox_index.contains_point(router.start.t.disp.to_p())
+            or self.bbox_index.contains_point(router.end.t.disp.to_p())
+            for router in self.routers
+        )
+
+    def lines_keep_spacing(self, routed_lines: list[tuple[int, int]]) -> bool:
+        routed_lines.sort()
+        for (coord, width), (next_coord, next_width) in pairwise(routed_lines):
+            min_spacing = (width + 1) // 2 + next_width // 2 + self.separation
+            if next_coord - coord < min_spacing:
+                return False
+        return True
+
+    def route_obstacle_free_independent_channels(self) -> bool:
+        if not self.can_use_independent_channel_paths():
+            return False
+
+        router_state = self.save_router_state()
+        try:
+            for router in self.routers:
+                router.auto_route()
+            if self.routes_keep_clearance():
+                return True
+        except ValueError:
+            pass
+
+        self.restore_router_state(router_state)
+        return False
+
+    def routes_keep_clearance(self) -> bool:
+        inflated_routes: list[tuple[kdb.Box, kdb.Region]] = []
+        for router in self.routers:
+            if len(router.start.pts) < 2:
+                return False
+            collisions, _ = router.collisions(log_errors=None)
+            if not collisions.is_empty():
+                return False
+
+            route_region = self.route_clearance_region(router)
+            route_bbox = route_region.bbox()
+            for other_bbox, other_region in inflated_routes:
+                if (route_bbox & other_bbox).empty():
+                    continue
+                if not (route_region & other_region).is_empty():
+                    return False
+
+            if not self.bbox_index.empty and self.bbox_index.intersects_region(
+                self.obstacle_clearance_region(router)
+            ):
+                return False
+            inflated_routes.append((route_bbox, route_region))
+        return True
+
+    def route_clearance_region(self, router: ManhattanRouter) -> kdb.Region:
+        path_width = max(router.width + self.separation, 1)
+        return kdb.Region(kdb.Path(router.start.pts, path_width).polygon())
+
+    def obstacle_clearance_region(self, router: ManhattanRouter) -> kdb.Region:
+        path_width = max(router.width + 2 * self.separation, 1)
+        return kdb.Region(kdb.Path(router.start.pts, path_width).polygon())
+
+    def save_router_state(
+        self,
+    ) -> list[tuple[kdb.Trans, list[kdb.Point], kdb.Trans, list[kdb.Point], bool]]:
+        return [
+            (
+                router.start.t.dup(),
+                list(router.start.pts),
+                router.end.t.dup(),
+                list(router.end.pts),
+                router.finished,
+            )
+            for router in self.routers
+        ]
+
+    def restore_router_state(
+        self,
+        router_state: Sequence[
+            tuple[kdb.Trans, list[kdb.Point], kdb.Trans, list[kdb.Point], bool]
+        ],
+    ) -> None:
+        for router, (start_t, start_pts, end_t, end_pts, finished) in zip(
+            self.routers, router_state, strict=False
+        ):
+            router.start.t = start_t
+            router.start.pts = list(start_pts)
+            router.end.t = end_t
+            router.end.pts = list(end_pts)
+            router.finished = finished
 
 
 def is_manhattan(vector: kdb.Vector) -> bool:
@@ -2225,63 +2455,50 @@ def _route_to_side(
 
     def _sort_route(router: ManhattanRouterSide) -> int:
         y = (kdb.Trans(-router.t.angle, False, 0, 0) * router.t.disp).y
-        if clockwise:
-            return -y
-        return y
+        return -y if clockwise else y
 
     sorted_rs = sorted(routers, key=_sort_route)
     for rs in sorted_rs:
+        t = rs.t
         hw1 = rs.router.width // 2
         hw2 = rs.router.width - hw1
-        match rs.t.angle:
+        br = rs.router.bend90_radius
+        match t.angle:
             case 0:
-                s = (
-                    bbox.right
-                    + hw1
-                    + separation
-                    - rs.t.disp.x
-                    - rs.router.bend90_radius
-                )
+                s = bbox.right + hw1 + separation - t.disp.x - br
             case 1:
-                s = bbox.top + hw1 + separation - rs.t.disp.y - rs.router.bend90_radius
+                s = bbox.top + hw1 + separation - t.disp.y - br
             case 2:
-                s = (
-                    rs.t.disp.x
-                    - (bbox.left - hw1 - separation)
-                    - rs.router.bend90_radius
-                )
+                s = t.disp.x - (bbox.left - hw1 - separation) - br
             case _:
-                s = (
-                    rs.t.disp.y
-                    - (bbox.bottom - hw1 - separation)
-                    - rs.router.bend90_radius
-                )
+                s = t.disp.y - (bbox.bottom - hw1 - separation) - br
         rs.straight(s)
         tv = rs.tv
+        ta = rs.ta
         x = tv.x
         y = tv.y
         if clockwise:
-            match rs.ta:
+            match ta:
                 case 3:
-                    if x >= rs.router.bend90_radius:
+                    if x >= br:
                         rs.straight_nobend(x)
-                    elif x > -rs.router.bend90_radius and not allow_sbends:
-                        rs.straight(rs.router.bend90_radius + x)
+                    elif x > -br and not allow_sbends:
+                        rs.straight(br + x)
                 case 0 if x > 0:
                     rs.straight(x)
-            if not (y == 0 and rs.ta == ANGLE_180 and x > 0):
+            if not (y == 0 and ta == ANGLE_180 and x > 0):
                 rs.left()
             bbox += rs.t * kdb.Point(0, -hw2)
         else:
-            match rs.ta:
+            match ta:
                 case 1:
-                    if x >= rs.router.bend90_radius:
+                    if x >= br:
                         rs.straight_nobend(x)
-                    elif x > -rs.router.bend90_radius and not allow_sbends:
-                        rs.straight(rs.router.bend90_radius + x)
+                    elif x > -br and not allow_sbends:
+                        rs.straight(br + x)
                 case 0 if x > 0:
                     rs.straight(x)
-            if not (y == 0 and rs.ta == ANGLE_180 and x > 0):
+            if not (y == 0 and ta == ANGLE_180 and x > 0):
                 rs.right()
             bbox += rs.t * kdb.Point(0, hw2)
 
@@ -2804,9 +3021,11 @@ def clean_points(
         v2 = p_n - p  # ty:ignore[unsupported-operator]
         v1 = p - p_p  # ty:ignore[unsupported-operator]
 
-        if (
-            (np.sign(v1.x) == np.sign(v2.x)) and (np.sign(v1.y) == np.sign(v2.y))
-        ) or v2.abs() == 0:
+        same_direction = (v1.x > 0) == (v2.x > 0) and (v1.x < 0) == (v2.x < 0)
+        same_direction = (
+            same_direction and (v1.y > 0) == (v2.y > 0) and (v1.y < 0) == (v2.y < 0)
+        )
+        if same_direction or v2.abs() == 0:
             del_points.append(i - 1)
         else:
             p_p = p
