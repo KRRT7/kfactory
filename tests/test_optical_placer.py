@@ -7,13 +7,21 @@ from typing import TYPE_CHECKING
 import pytest
 
 import kfactory as kf
-from kfactory.routing.generic import ManhattanRoute
+from kfactory.routing.generic import ManhattanBundlePlan, ManhattanRoute
+from kfactory.routing.manhattan import route_smart
 from kfactory.routing.optical import (
+    OpticalBundlePlanner,
     _place_straight,
     _place_tapered_straight,
+    build_manhattan_route_plan,
     place_manhattan,
     place_manhattan_with_sbends,
     vec_angle_sbend,
+)
+from kfactory.routing.plan import (
+    AppendBend90RouteOp,
+    CreateBend90RouteOp,
+    StraightRouteOp,
 )
 
 if TYPE_CHECKING:
@@ -88,6 +96,121 @@ def test_place_straight_basic(
     )
     assert len(route.instances) == 1
     assert route.length_straights == 50_000
+
+
+def test_build_manhattan_plan_two_points_has_single_straight(
+    bend90: kf.KCell,
+    kcl: kf.KCLayout,
+    layers: Layers,
+) -> None:
+    c = kcl.kcell("plan_two_points")
+    p1 = _make_o_port(kcl, layers, "p1", 0, 0, 0)
+    p2 = _make_o_port(kcl, layers, "p2", 2, 50_000, 0)
+
+    plan, _taper_cell = build_manhattan_route_plan(
+        p1,
+        p2,
+        [kf.kdb.Point(0, 0), kf.kdb.Point(50_000, 0)],
+        route_width=None,
+        bend90_cell=bend90,
+        taper_cell=None,
+        port_type="optical",
+        min_straight_taper=0,
+        allow_small_routes=False,
+    )
+
+    assert len(c.insts) == 0
+    assert len(plan.ops) == 3
+    assert isinstance(plan.ops[0], StraightRouteOp)
+    assert plan.ops[0].width == 500
+
+
+def test_build_manhattan_plan_three_points_has_bend_ops(
+    bend90: kf.KCell,
+    kcl: kf.KCLayout,
+    layers: Layers,
+) -> None:
+    c = kcl.kcell("plan_three_points")
+    p1 = _make_o_port(kcl, layers, "p1", 0, 0, 0)
+    p2 = _make_o_port(kcl, layers, "p2", 1, 50_000, 50_000)
+
+    plan, _taper_cell = build_manhattan_route_plan(
+        p1,
+        p2,
+        [
+            kf.kdb.Point(0, 0),
+            kf.kdb.Point(50_000, 0),
+            kf.kdb.Point(50_000, 50_000),
+        ],
+        route_width=None,
+        bend90_cell=bend90,
+        taper_cell=None,
+        port_type="optical",
+        min_straight_taper=0,
+        allow_small_routes=False,
+    )
+
+    assert len(c.insts) == 0
+    assert sum(isinstance(op, CreateBend90RouteOp) for op in plan.ops) == 1
+    assert sum(isinstance(op, AppendBend90RouteOp) for op in plan.ops) == 1
+    assert sum(isinstance(op, StraightRouteOp) for op in plan.ops) == 2
+
+
+def test_optical_bundle_planner_separates_plan_and_materialize(
+    bend90: kf.KCell,
+    straight_factory_dbu: Callable[..., kf.KCell],
+    kcl: kf.KCLayout,
+    layers: Layers,
+) -> None:
+    c = kcl.kcell("optical_bundle_planner_boundary")
+    p1 = _make_o_port(kcl, layers, "p1", 0, 0, 0)
+    p2 = _make_o_port(kcl, layers, "p2", 2, 50_000, 0)
+    routers = route_smart(
+        start_ports=[p1.base],
+        end_ports=[p2.base],
+        widths=[p1.width],
+        bend90_radius=kf.routing.generic.get_radius(list(bend90.ports)),
+        separation=5_000,
+        starts=[[]],
+        ends=[[]],
+        bboxes=[],
+        sort_ports=False,
+        bbox_routing="minimal",
+        allow_sbend=False,
+    )
+    manhattan_plan = ManhattanBundlePlan(
+        routers=routers,
+        start_ports=[p1.base],
+        end_ports=[p2.base],
+    )
+    planner = OpticalBundlePlanner(
+        c=c,
+        manhattan_plan=manhattan_plan,
+        straight_factory=straight_factory_dbu,
+        bend90_cell=bend90,
+        taper_cell=None,
+        route_width=None,
+        port_type="optical",
+        min_straight_taper=0,
+        allow_small_routes=False,
+        allow_width_mismatch=False,
+        allow_layer_mismatch=False,
+        allow_type_mismatch=False,
+        purpose=None,
+        sbend_factory=None,
+        on_placer_error="error",
+    )
+
+    optical_plan = planner.plan()
+
+    assert len(c.insts) == 0
+    assert len(optical_plan.route_plans) == 1
+    assert len(optical_plan.route_plans[0].ops) > 0
+
+    routes = planner.materialize(optical_plan)
+
+    assert len(routes) == 1
+    assert routes[0].length_straights == 50_000
 
 
 # _place_tapered_straight
